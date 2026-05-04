@@ -1,1 +1,14 @@
-
+{
+  "name": "kaos-renderer",
+  "version": "1.0.0",
+  "description": "KAOS visual renderer for Instagram cards",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^131.0.1",
+    "express": "^4.18.3",
+    "puppeteer-core": "^23.11.1"
+  }
+}
