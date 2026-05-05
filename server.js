@@ -1,541 +1,535 @@
 const express = require("express");
-const puppeteer = require("puppeteer-core");
-const chromium = require("@sparticuz/chromium");
+const { createCanvas, loadImage } = require("canvas");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-
 const PORT = process.env.PORT || 3000;
 
-function sanitizeText(value, fallback = "") {
-  return String(value || fallback)
-    .replace(/[<>]/g, "")
-    .trim()
-    .slice(0, 500);
+app.use(express.json({ limit: "5mb" }));
+
+/* ---------------------------
+   BASIC ENDPOINTS
+--------------------------- */
+
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "kaos-renderer",
+    endpoints: ["/health", "/debug/env", "/render/resolved"],
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "kaos-renderer",
+  });
+});
+
+app.get("/debug/env", (_req, res) => {
+  res.json({
+    ok: true,
+    renderer: "kaos-renderer",
+    pexels_key_available: !!process.env.PEXELS_API_KEY,
+    kaos_logo_url_available: !!process.env.KAOS_LOGO_URL,
+  });
+});
+
+/* ---------------------------
+   HELPERS
+--------------------------- */
+
+function cleanText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).replace(/\s+/g, " ").trim();
 }
 
-function getVerdictColor(verdict) {
-  const v = String(verdict || "").toUpperCase();
-
-  if (v === "FULFILLED") return "#16a34a";
-  if (v === "PARTLY TRUE") return "#f59e0b";
-  if (v === "UNVERIFIABLE") return "#6b7280";
-
-  return "#ef1b2d";
+function clamp(num, min, max) {
+  return Math.max(min, Math.min(max, num));
 }
 
-function getFallbackBackground(topic) {
-  const t = String(topic || "").toLowerCase();
+function wrapText(ctx, text, maxWidth) {
+  const words = cleanText(text).split(" ");
+  const lines = [];
+  let currentLine = "";
 
-  if (t.includes("crypto") || t.includes("bitcoin") || t.includes("market")) {
-    return `
-      radial-gradient(circle at 20% 20%, rgba(245,158,11,0.28) 0%, transparent 30%),
-      radial-gradient(circle at 88% 70%, rgba(124,45,18,0.35) 0%, transparent 36%),
-      linear-gradient(135deg, #020617 0%, #0f172a 55%, #111827 100%)
-    `;
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    const width = ctx.measureText(testLine).width;
+    if (width <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
   }
 
-  if (t.includes("mobility") || t.includes("robotaxi") || t.includes("car") || t.includes("tesla")) {
-    return `
-      radial-gradient(circle at 25% 25%, rgba(56,189,248,0.25) 0%, transparent 30%),
-      radial-gradient(circle at 82% 68%, rgba(29,78,216,0.34) 0%, transparent 36%),
-      linear-gradient(135deg, #020617 0%, #0f172a 55%, #111827 100%)
-    `;
-  }
-
-  if (t.includes("politic") || t.includes("election") || t.includes("geopolitic")) {
-    return `
-      radial-gradient(circle at 30% 20%, rgba(239,68,68,0.28) 0%, transparent 30%),
-      radial-gradient(circle at 75% 75%, rgba(29,78,216,0.28) 0%, transparent 34%),
-      linear-gradient(135deg, #020617 0%, #111827 55%, #1f2937 100%)
-    `;
-  }
-
-  if (t.includes("ai") || t.includes("tech")) {
-    return `
-      radial-gradient(circle at 20% 30%, rgba(139,92,246,0.30) 0%, transparent 32%),
-      radial-gradient(circle at 80% 60%, rgba(6,182,212,0.25) 0%, transparent 32%),
-      linear-gradient(135deg, #020617 0%, #111827 60%, #030712 100%)
-    `;
-  }
-
-  return `
-    radial-gradient(circle at 25% 20%, rgba(220,38,38,0.25) 0%, transparent 32%),
-    radial-gradient(circle at 80% 75%, rgba(51,65,85,0.38) 0%, transparent 34%),
-    linear-gradient(135deg, #020617 0%, #111827 60%, #030712 100%)
-  `;
+  if (currentLine) lines.push(currentLine);
+  return lines;
 }
 
-function buildPexelsQuery(payload) {
-  const explicit = sanitizeText(payload.background_query || "", "");
-  if (explicit) return explicit;
+function fitWrappedText(ctx, text, maxWidth, maxHeight, startSize, minSize, fontFamily, fontStyle = "normal") {
+  let size = startSize;
 
-  const topic = String(payload.topic || "").toLowerCase();
-
-  if (topic.includes("economy") || topic.includes("recession") || topic.includes("finance")) {
-    return "financial district skyline economy markets recession";
+  while (size >= minSize) {
+    ctx.font = `${fontStyle} ${size}px ${fontFamily}`;
+    const lines = wrapText(ctx, text, maxWidth);
+    const lineHeight = size * 1.28;
+    const totalHeight = lines.length * lineHeight;
+    if (totalHeight <= maxHeight) {
+      return { size, lines, lineHeight };
+    }
+    size -= 2;
   }
 
-  if (topic.includes("crypto") || topic.includes("bitcoin")) {
-    return "bitcoin market chart";
-  }
-
-  if (topic.includes("mobility") || topic.includes("robotaxi") || topic.includes("car")) {
-    return "autonomous car city road";
-  }
-
-  if (topic.includes("politic") || topic.includes("election")) {
-    return "election ballot voting";
-  }
-
-  if (topic.includes("ai") || topic.includes("technology")) {
-    return "artificial intelligence data center";
-  }
-
-  return "financial district skyline charts night";
+  ctx.font = `${fontStyle} ${minSize}px ${fontFamily}`;
+  const lines = wrapText(ctx, text, maxWidth);
+  return {
+    size: minSize,
+    lines,
+    lineHeight: minSize * 1.28,
+  };
 }
 
-async function getPexelsPhotoUrl(payload) {
+async function fetchBufferFromUrl(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch asset: ${url} (${response.status})`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+function buildPexelsQuery(topic, shortSubject, quote) {
+  const t = `${cleanText(topic)} ${cleanText(shortSubject)} ${cleanText(quote)}`.toLowerCase();
+
+  if (t.includes("recession") || t.includes("economy") || t.includes("gdp") || t.includes("market") || t.includes("inflation")) {
+    return "financial district skyline charts night";
+  }
+  if (t.includes("bitcoin") || t.includes("crypto")) {
+    return "crypto trading screen finance technology";
+  }
+  if (t.includes("tesla") || t.includes("robotaxi") || t.includes("autonomous") || t.includes("cars")) {
+    return "futuristic city autonomous car night";
+  }
+  if (t.includes("election") || t.includes("president") || t.includes("vote") || t.includes("politics")) {
+    return "government building city night news";
+  }
+  if (t.includes("ai") || t.includes("artificial intelligence") || t.includes("white-collar")) {
+    return "artificial intelligence office technology";
+  }
+
+  return "technology business future concept";
+}
+
+async function fetchPexelsPhoto(query) {
   const apiKey = process.env.PEXELS_API_KEY;
-
   if (!apiKey) {
     return {
       used: false,
-      reason: "PEXELS_API_KEY is not available in Render environment",
-      query: buildPexelsQuery(payload),
+      query,
+      photoId: null,
       photoUrl: null,
-      photoId: null
+      imageUrl: null,
+      error: "PEXELS_API_KEY missing",
     };
   }
 
-  const query = buildPexelsQuery(payload);
-  const url = new URL("https://api.pexels.com/v1/search");
-  url.searchParams.set("query", query);
-  url.searchParams.set("orientation", "landscape");
-  url.searchParams.set("per_page", "10");
+  const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=square`;
 
-  const response = await fetch(url.toString(), {
+  const response = await fetch(url, {
     headers: {
-      Authorization: apiKey
-    }
+      Authorization: apiKey,
+    },
   });
 
   if (!response.ok) {
+    const body = await response.text();
     return {
       used: false,
-      reason: `Pexels API returned HTTP ${response.status}`,
       query,
+      photoId: null,
       photoUrl: null,
-      photoId: null
+      imageUrl: null,
+      error: `Pexels API error ${response.status}: ${body}`,
     };
   }
 
   const data = await response.json();
-  const photos = Array.isArray(data.photos) ? data.photos : [];
+  const photo = data.photos && data.photos[0];
 
-  if (photos.length === 0) {
+  if (!photo) {
     return {
       used: false,
-      reason: "Pexels returned no photos",
       query,
+      photoId: null,
       photoUrl: null,
-      photoId: null
+      imageUrl: null,
+      error: "No Pexels photo found",
     };
   }
-
-  const chosen = photos[0];
 
   return {
     used: true,
-    reason: null,
     query,
-    photoUrl: chosen.src && (chosen.src.large2x || chosen.src.large || chosen.src.original),
-    photoId: chosen.id
+    photoId: photo.id ? String(photo.id) : null,
+    photoUrl: photo.url || null,
+    imageUrl:
+      (photo.src && (photo.src.large2x || photo.src.large || photo.src.original)) || null,
+    error: null,
   };
 }
 
-function buildHtml(payload, pexels) {
-  const verdict = sanitizeText(payload.verdict, "FAILED").toUpperCase();
-  const forecasterName = sanitizeText(payload.forecaster_name || payload.short_subject, "Jamie Dimon");
-  const forecasterContext = sanitizeText(payload.forecaster_context, "JPMorgan CEO");
-  const predictionQuote = sanitizeText(
-    payload.prediction_quote || payload.quote,
-    "These are very, very serious things which I think are likely to put the U.S. in some kind of recession six to nine months from now."
-  );
-  const predictionDate = sanitizeText(payload.prediction_date || payload.deadline, "Oct 10, 2022");
-  const topic = sanitizeText(payload.topic, "");
-  const verdictColor = getVerdictColor(verdict);
+async function loadPexelsBackground(query) {
+  const meta = await fetchPexelsPhoto(query);
 
-  const logoUrl = sanitizeText(payload.logo_url || process.env.KAOS_LOGO_URL || "", "");
-
-  const backgroundCss = pexels && pexels.used && pexels.photoUrl
-    ? `url("${pexels.photoUrl}")`
-    : getFallbackBackground(topic);
-
-  const backgroundExtraCss = pexels && pexels.used && pexels.photoUrl
-    ? `
-      background-image: ${backgroundCss};
-      background-size: cover;
-      background-position: center;
-    `
-    : `
-      background: ${backgroundCss};
-    `;
-
-  const logoHtml = logoUrl
-    ? `<img class="logo" src="${logoUrl}" alt="KAOS logo" />`
-    : "";
-
-  return `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    html, body {
-      margin: 0;
-      padding: 0;
-      width: 1080px;
-      height: 1080px;
-      overflow: hidden;
-      font-family: Arial, Helvetica, sans-serif;
-      background: #020617;
-    }
-
-    .card {
-      width: 1080px;
-      height: 1080px;
-      position: relative;
-      overflow: hidden;
-      color: #f8fafc;
-      ${backgroundExtraCss}
-    }
-
-    .photoOverlay {
-      position: absolute;
-      inset: 0;
-      background:
-        linear-gradient(90deg, rgba(2,6,23,0.90) 0%, rgba(2,6,23,0.74) 48%, rgba(2,6,23,0.86) 100%),
-        linear-gradient(180deg, rgba(2,6,23,0.40) 0%, rgba(2,6,23,0.92) 100%);
-      backdrop-filter: blur(1.2px);
-    }
-
-    .softTexture {
-      position: absolute;
-      inset: 0;
-      opacity: 0.18;
-      background:
-        radial-gradient(circle at 18% 18%, rgba(148,163,184,0.18) 0%, transparent 28%),
-        radial-gradient(circle at 82% 24%, rgba(239,27,45,0.10) 0%, transparent 30%),
-        radial-gradient(circle at 72% 82%, rgba(15,23,42,0.72) 0%, transparent 42%);
-    }
-
-    .content {
-      position: absolute;
-      inset: 0;
-      padding: 80px 84px 76px 84px;
-    }
-
-    .label {
-      position: absolute;
-      top: 76px;
-      left: 84px;
-      padding: 14px 30px;
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 14px;
-      background: rgba(2,6,23,0.60);
-      font-size: 35px;
-      line-height: 1;
-      font-weight: 850;
-      letter-spacing: 0.01em;
-      color: #f8fafc;
-      z-index: 5;
-      text-shadow: 0 2px 12px rgba(0,0,0,0.45);
-    }
-
-    .stamp {
-      position: absolute;
-      top: 72px;
-      right: 58px;
-      z-index: 20;
-      transform: rotate(-6deg);
-      border: 10px solid #ff9aaa;
-      color: #ffffff;
-      background: ${verdictColor};
-      padding: 28px 56px;
-      border-radius: 18px;
-      font-size: ${verdict.length > 10 ? "66px" : "82px"};
-      line-height: 0.92;
-      font-weight: 950;
-      letter-spacing: 0.035em;
-      text-transform: uppercase;
-      box-shadow:
-        0 20px 55px rgba(0,0,0,0.45),
-        inset 0 0 0 4px rgba(255,255,255,0.25);
-    }
-
-    .stamp::after {
-      content: "";
-      position: absolute;
-      inset: 14px;
-      border: 4px dashed rgba(255,255,255,0.55);
-      border-radius: 12px;
-      pointer-events: none;
-    }
-
-    .identity {
-      position: absolute;
-      top: 240px;
-      left: 96px;
-      right: 350px;
-      z-index: 4;
-    }
-
-    .name {
-      font-size: 66px;
-      line-height: 1.02;
-      font-weight: 850;
-      letter-spacing: -0.035em;
-      color: #f8fafc;
-      text-shadow: 0 4px 22px rgba(0,0,0,0.70);
-    }
-
-    .role {
-      margin-top: 14px;
-      font-size: 34px;
-      line-height: 1.1;
-      font-weight: 500;
-      color: rgba(248,250,252,0.82);
-      text-shadow: 0 4px 18px rgba(0,0,0,0.62);
-    }
-
-    .quoteBox {
-      position: absolute;
-      left: 96px;
-      right: 260px;
-      top: 410px;
-      min-height: 345px;
-      max-height: 410px;
-      padding: 34px 38px 78px 38px;
-      z-index: 4;
-      border-radius: 24px;
-      background: rgba(0,0,0,0.58);
-      border: 1px solid rgba(255,255,255,0.10);
-      box-shadow:
-        0 24px 70px rgba(0,0,0,0.35),
-        inset 0 0 0 1px rgba(255,255,255,0.03);
-      overflow: hidden;
-    }
-
-    .quote {
-      margin: 0;
-      font-family: Georgia, "Times New Roman", serif;
-      font-style: italic;
-      font-weight: 700;
-      font-size: ${predictionQuote.length > 190 ? "34px" : predictionQuote.length > 135 ? "40px" : "46px"};
-      line-height: 1.18;
-      color: #ffffff;
-      letter-spacing: -0.012em;
-      text-shadow: 0 3px 16px rgba(0,0,0,0.80);
-    }
-
-    .date {
-      position: absolute;
-      right: 38px;
-      bottom: 28px;
-      font-size: 26px;
-      font-weight: 800;
-      color: rgba(255,255,255,0.88);
-      text-shadow: 0 3px 16px rgba(0,0,0,0.80);
-      z-index: 6;
-    }
-
-    .logoWrap {
-      position: absolute;
-      right: 86px;
-      bottom: 78px;
-      width: 132px;
-      height: 132px;
-      border-radius: 50%;
-      overflow: hidden;
-      z-index: 8;
-      opacity: 0.82;
-      box-shadow: 0 12px 36px rgba(0,0,0,0.55);
-      background: rgba(0,0,0,0.25);
-    }
-
-    .logo {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      display: block;
-      border-radius: 50%;
-    }
-
-    .brandFallback {
-      position: absolute;
-      right: 92px;
-      bottom: 88px;
-      z-index: 8;
-      font-size: 28px;
-      font-weight: 900;
-      letter-spacing: 0.08em;
-      color: rgba(255,255,255,0.35);
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="photoOverlay"></div>
-    <div class="softTexture"></div>
-
-    <div class="content">
-      <div class="label">KAOS RESOLVED</div>
-      <div class="stamp">${verdict}</div>
-
-      <div class="identity">
-        <div class="name">${forecasterName}</div>
-        <div class="role">— ${forecasterContext}</div>
-      </div>
-
-      <div class="quoteBox">
-        <p class="quote">“${predictionQuote}”</p>
-        <div class="date">${predictionDate}</div>
-      </div>
-
-      ${logoUrl ? `<div class="logoWrap">${logoHtml}</div>` : `<div class="brandFallback">KAOS</div>`}
-    </div>
-  </div>
-</body>
-</html>`;
-}
-
-async function renderJpg(payload) {
-  const pexels = await getPexelsPhotoUrl(payload);
-
-  const browser = await puppeteer.launch({
-    args: chromium.args,
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
-    defaultViewport: {
-      width: 1080,
-      height: 1080,
-      deviceScaleFactor: 1
-    }
-  });
-
-  try {
-    const page = await browser.newPage();
-
-    await page.setViewport({
-      width: 1080,
-      height: 1080,
-      deviceScaleFactor: 1
-    });
-
-    await page.setContent(buildHtml(payload, pexels), {
-      waitUntil: "networkidle0",
-      timeout: 30000
-    });
-
-    const screenshot = await page.screenshot({
-      type: "jpeg",
-      quality: 92,
-      clip: {
-        x: 0,
-        y: 0,
-        width: 1080,
-        height: 1080
-      }
-    });
-
+  if (!meta.used || !meta.imageUrl) {
     return {
-      buffer: Buffer.from(screenshot),
-      pexels
+      ...meta,
+      image: null,
     };
-  } finally {
-    await browser.close();
+  }
+
+  try {
+    const buffer = await fetchBufferFromUrl(meta.imageUrl);
+    const image = await loadImage(buffer);
+    return {
+      ...meta,
+      image,
+    };
+  } catch (error) {
+    return {
+      used: false,
+      query,
+      photoId: meta.photoId,
+      photoUrl: meta.photoUrl,
+      imageUrl: meta.imageUrl,
+      image: null,
+      error: `Failed to load Pexels image: ${error.message}`,
+    };
   }
 }
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "kaos-renderer"
-  });
-});
-
-app.get("/debug/env", (req, res) => {
-  res.json({
-    ok: true,
-    renderer: "kaos-renderer",
-    pexels_key_available: Boolean(process.env.PEXELS_API_KEY),
-    kaos_logo_url_available: Boolean(process.env.KAOS_LOGO_URL)
-  });
-});
-
-app.post("/render/resolved/debug", async (req, res) => {
-  try {
-    const result = await renderJpg(req.body || {});
-    const buffer = result.buffer;
-    const magic = buffer.subarray(0, 3).toString("hex").toUpperCase();
-
-    res.json({
-      ok: true,
-      isBuffer: Buffer.isBuffer(buffer),
-      byteLength: buffer.length,
-      magic,
-      validJpeg: magic === "FFD8FF",
-      pexels_background_attempted: true,
-      pexels_background_used: Boolean(result.pexels && result.pexels.used),
-      pexels_query: result.pexels ? result.pexels.query : null,
-      pexels_photo_id: result.pexels ? result.pexels.photoId : null,
-      pexels_photo_url: result.pexels ? result.pexels.photoUrl : null,
-      pexels_reason: result.pexels ? result.pexels.reason : null
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      ok: false,
-      error: error.message || "Debug render failed"
-    });
+async function loadKaosLogo() {
+  const logoUrl = process.env.KAOS_LOGO_URL;
+  if (!logoUrl) {
+    return {
+      used: false,
+      url: null,
+      image: null,
+      error: "KAOS_LOGO_URL missing",
+    };
   }
-});
+
+  try {
+    const buffer = await fetchBufferFromUrl(logoUrl);
+    const image = await loadImage(buffer);
+    return {
+      used: true,
+      url: logoUrl,
+      image,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      used: false,
+      url: logoUrl,
+      image: null,
+      error: `Failed to load logo: ${error.message}`,
+    };
+  }
+}
+
+function drawBackground(ctx, canvas, bgImage, topic) {
+  if (bgImage) {
+    const imgRatio = bgImage.width / bgImage.height;
+    const canvasRatio = canvas.width / canvas.height;
+
+    let drawWidth;
+    let drawHeight;
+    let dx;
+    let dy;
+
+    if (imgRatio > canvasRatio) {
+      drawHeight = canvas.height;
+      drawWidth = drawHeight * imgRatio;
+      dx = (canvas.width - drawWidth) / 2;
+      dy = 0;
+    } else {
+      drawWidth = canvas.width;
+      drawHeight = drawWidth / imgRatio;
+      dx = 0;
+      dy = (canvas.height - drawHeight) / 2;
+    }
+
+    ctx.drawImage(bgImage, dx, dy, drawWidth, drawHeight);
+
+    // Overlay for readability
+    const overlay = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    overlay.addColorStop(0, "rgba(8, 14, 28, 0.48)");
+    overlay.addColorStop(0.55, "rgba(8, 14, 28, 0.62)");
+    overlay.addColorStop(1, "rgba(8, 14, 28, 0.78)");
+    ctx.fillStyle = overlay;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  } else {
+    const t = cleanText(topic).toLowerCase();
+
+    let g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+
+    if (t.includes("recession") || t.includes("economy") || t.includes("market")) {
+      g.addColorStop(0, "#0b1630");
+      g.addColorStop(0.5, "#16355f");
+      g.addColorStop(1, "#09111f");
+    } else if (t.includes("bitcoin") || t.includes("crypto")) {
+      g.addColorStop(0, "#17142c");
+      g.addColorStop(0.5, "#24306b");
+      g.addColorStop(1, "#0f1322");
+    } else if (t.includes("tesla") || t.includes("robotaxi") || t.includes("autonomous")) {
+      g.addColorStop(0, "#071420");
+      g.addColorStop(0.5, "#0b3c5d");
+      g.addColorStop(1, "#081018");
+    } else {
+      g.addColorStop(0, "#0c1833");
+      g.addColorStop(0.5, "#1b406b");
+      g.addColorStop(1, "#081018");
+    }
+
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // subtle abstract grid
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    ctx.lineWidth = 1;
+    for (let x = 0; x < canvas.width; x += 80) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+      ctx.stroke();
+    }
+    for (let y = 0; y < canvas.height; y += 80) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawStamp(ctx, verdict) {
+  const isFailed = cleanText(verdict).toUpperCase() === "FAILED";
+  const stampText = isFailed ? "FAILED" : "FULFILLED";
+  const stampColor = isFailed ? "#ff2b2b" : "#18c964";
+
+  ctx.save();
+  ctx.translate(930, 155);
+  ctx.rotate(-0.12);
+
+  ctx.strokeStyle = stampColor;
+  ctx.fillStyle = "rgba(255,255,255,0.03)";
+  ctx.lineWidth = 10;
+  ctx.beginPath();
+  ctx.roundRect(-165, -58, 330, 116, 24);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = "bold 54px Arial";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = stampColor;
+  ctx.shadowColor = "rgba(0,0,0,0.35)";
+  ctx.shadowBlur = 14;
+  ctx.fillText(stampText, 0, 0);
+
+  ctx.restore();
+}
+
+function drawLogoBadge(ctx, logoImage) {
+  if (!logoImage) return;
+
+  const size = 92;
+  const x = 1200 - 60 - size;
+  const y = 1200 - 60 - size;
+
+  ctx.save();
+
+  ctx.beginPath();
+  ctx.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+
+  ctx.globalAlpha = 0.95;
+  ctx.drawImage(logoImage, x, y, size, size);
+
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255,0.5)";
+  ctx.stroke();
+}
+
+function drawResolvedCard(payload, backgroundMeta, logoMeta) {
+  const canvas = createCanvas(1200, 1200);
+  const ctx = canvas.getContext("2d");
+
+  const verdict = cleanText(payload.verdict).toUpperCase();
+  const shortSubject = cleanText(payload.short_subject);
+  const deadline = cleanText(payload.deadline);
+  const topic = cleanText(payload.topic);
+  const quote = cleanText(payload.quote || payload.prediction || shortSubject);
+  const speakerName = cleanText(payload.speaker_name || payload.forecaster || "");
+  const speakerTitle = cleanText(payload.speaker_title || payload.forecaster_title || "");
+  const predictionDate = cleanText(
+    payload.prediction_date ||
+      payload.said_date ||
+      payload.date ||
+      payload.prediction_made_on ||
+      ""
+  );
+
+  drawBackground(ctx, canvas, backgroundMeta.image, topic);
+
+  const textColor = "#ffffff";
+  const accentColor = "rgba(255,255,255,0.78)";
+
+  // Top label
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.font = "bold 34px Arial";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText("KAOS RESOLVED", 70, 80);
+
+  // Stamp
+  drawStamp(ctx, verdict);
+
+  // Subject
+  ctx.fillStyle = accentColor;
+  ctx.font = "bold 30px Arial";
+  ctx.fillText(shortSubject, 70, 170);
+
+  // Speaker line
+  const speakerLine = speakerTitle
+    ? `${speakerName} — ${speakerTitle}`
+    : speakerName;
+
+  if (speakerLine) {
+    ctx.fillStyle = "rgba(255,255,255,0.88)";
+    ctx.font = "bold 34px Arial";
+    ctx.fillText(speakerLine, 70, 260);
+  }
+
+  // Quote
+  const quoteTop = speakerLine ? 320 : 260;
+  const quoteWidth = 900;
+  const quoteHeight = 410;
+
+  const quoteFit = fitWrappedText(
+    ctx,
+    `“${quote}”`,
+    quoteWidth,
+    quoteHeight,
+    52,
+    30,
+    "Georgia",
+    "italic"
+  );
+
+  ctx.fillStyle = textColor;
+  ctx.font = `italic ${quoteFit.size}px Georgia`;
+  ctx.shadowColor = "rgba(0,0,0,0.35)";
+  ctx.shadowBlur = 8;
+
+  let y = quoteTop;
+  for (const line of quoteFit.lines) {
+    ctx.fillText(line, 70, y);
+    y += quoteFit.lineHeight;
+  }
+
+  // Date under quote, aligned right
+  if (predictionDate) {
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "rgba(255,255,255,0.88)";
+    ctx.font = "bold 28px Arial";
+    ctx.textAlign = "right";
+    ctx.fillText(predictionDate, 70 + quoteWidth, y + 20);
+  }
+
+  // Bottom info
+  ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.font = "bold 30px Arial";
+  ctx.fillText("Resolved against deadline:", 70, 1030);
+
+  ctx.fillStyle = "rgba(255,255,255,0.80)";
+  ctx.font = "28px Arial";
+  ctx.fillText(deadline, 70, 1072);
+
+  // Logo bottom-right
+  drawLogoBadge(ctx, logoMeta.image);
+
+  return canvas.toBuffer("image/jpeg", {
+    quality: 0.9,
+    progressive: true,
+    chromaSubsampling: true,
+  });
+}
+
+/* ---------------------------
+   MAIN RENDER ENDPOINT
+--------------------------- */
 
 app.post("/render/resolved", async (req, res) => {
   try {
-    const result = await renderJpg(req.body || {});
-    const buffer = result.buffer;
+    const payload = req.body || {};
 
-    if (!Buffer.isBuffer(buffer)) {
-      throw new Error("Renderer did not return a Node Buffer");
+    const required = ["verdict", "short_subject", "deadline", "topic"];
+    const missing = required.filter((field) => !cleanText(payload[field]));
+
+    if (missing.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing one or more required fields: ${missing.join(", ")}`,
+      });
     }
 
-    const magic = buffer.subarray(0, 3).toString("hex").toUpperCase();
+    const pexelsQuery = buildPexelsQuery(
+      payload.topic,
+      payload.short_subject,
+      payload.quote || payload.prediction || payload.short_subject
+    );
 
-    if (magic !== "FFD8FF") {
-      throw new Error(`Invalid JPEG magic bytes: ${magic}`);
-    }
+    const [backgroundMeta, logoMeta] = await Promise.all([
+      loadPexelsBackground(pexelsQuery),
+      loadKaosLogo(),
+    ]);
 
-    res.status(200);
+    const jpegBuffer = drawResolvedCard(payload, backgroundMeta, logoMeta);
+
     res.setHeader("Content-Type", "image/jpeg");
-    res.setHeader("Content-Disposition", "inline; filename=\"kaos-card.jpg\"");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Length", buffer.length);
-    res.end(buffer);
+    res.setHeader("Content-Length", jpegBuffer.length);
+
+    // Observability headers
+    res.setHeader("X-KAOS-Pexels-Used", String(!!backgroundMeta.used));
+    res.setHeader("X-KAOS-Pexels-Photo-Id", backgroundMeta.photoId || "");
+    res.setHeader("X-KAOS-Pexels-Photo-Url", backgroundMeta.photoUrl || "");
+    res.setHeader("X-KAOS-Pexels-Query", backgroundMeta.query || "");
+    res.setHeader("X-KAOS-Logo-Used", String(!!logoMeta.used));
+    res.setHeader("X-KAOS-Logo-Url", logoMeta.url || "");
+
+    return res.status(200).send(jpegBuffer);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
+    console.error("Render error:", error);
+    return res.status(500).json({
       ok: false,
-      error: error.message || "Render failed"
+      error: error.message || "Unknown renderer error",
     });
   }
 });
 
+/* ---------------------------
+   START
+--------------------------- */
+
 app.listen(PORT, () => {
-  console.log(`KAOS renderer listening on ${PORT}`);
+  console.log(`KAOS renderer listening on port ${PORT}`);
 });
